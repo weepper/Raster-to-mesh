@@ -3,5 +3,8 @@ __pycache__/
 *.tif
 *.mmap
 *.stl
+*.stl.tmp
 .pytest_cache
 *.log
+paru/
+vllm_rocm/

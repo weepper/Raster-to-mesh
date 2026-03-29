@@ -15,6 +15,20 @@ The goal of this project is to provide a high-performance, memory-efficient pipe
 
 ## Change Log
 
+### 2026-03-29 | **Critical Topology Fixes & Decimation Pipeline Repair**
+| Change | Rationale | Details |
+| :--- | :--- | :--- |
+| **Fix RTIN degenerate triangles** | 25% of RTIN output was zero-area tris (e.g. `[v,v,v]`), poisoning corner-table topology and completely preventing decimation. | Added degenerate filter after RTIN extraction: `(t0 != t1) & (t1 != t2) & (t0 != t2)`. Eliminated 12,223 degenerate triangles per chunk. |
+| **Fix post-dedup degenerate filter** | `np.unique` coordinate remapping can collapse distinct indices → same vertex. | Added second degenerate filter after `_merge_and_deduplicate_indexed_meshes`. |
+| **Fix non-manifold edge elimination** | 8,149 non-manifold edges per chunk blocked all edge collapses. | Both fixes above eliminated all non-manifold edges (edges shared by >2 triangles). |
+| **Guard single-pixel wall segments** | Side wall generator emitted zero-width walls when runs had `c_start == c_end`. | Skip wall segments where both endpoints are the same grid position. |
+| **Defensive degenerate filter in decimation** | Belt-and-suspenders safety. | `decimate_mesh()` now filters degenerate triangles before building corner table. |
+| **V2C refresh improvement** | After edge collapse, V2C refresh started from deleted triangles. | Now searches surviving opposite triangles first, then falls back to walk. |
+| **Global decimation pass (Phase 7)** | Per-chunk decimation can't reach aggressive targets due to boundary locking. | New `global_decimate_stl()` runs QEM on the full assembled STL when still above target. |
+| **Default chunk size 256 → 512** | Larger chunks have better interior:boundary ratio for decimation. | Reduces boundary vertex percentage from ~90% to ~55%. |
+| **Improved estimation** | Triangle count estimator overshot by ~30%. | Multiplier reduced from 3.0 to 2.5; headroom from 1.1× to 1.2×. |
+| **is_global_boundary flag** | Preparation for selective boundary locking. | Chunks now know whether they touch the outermost global boundary. |
+
 ### 2026-03-28 | **Codebase Cleanup & Optimization**
 | Change | Rationale | Details |
 | :--- | :--- | :--- |

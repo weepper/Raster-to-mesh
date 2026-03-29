@@ -421,6 +421,8 @@ def edge_collapse(c, V, O, V2C, V_coords, Q, opt_pos, ring_from, ring_to,
     if o2 != -1: O[o2] = o1
 
     o = O[prev_c(c)]
+    o3 = np.int32(-1)
+    o4 = np.int32(-1)
     if o != -1:
         t2 = o // 3
         V[3*t2] = -1;  V[3*t2+1] = -1;  V[3*t2+2] = -1
@@ -433,37 +435,61 @@ def edge_collapse(c, V, O, V2C, V_coords, Q, opt_pos, ring_from, ring_to,
     V2C[v_from] = -1
     V_coords[v_from, 0] = np.nan
 
+    # Fix 6: Find a valid corner for v_to by checking surviving opposites
+    # first, then falling back to a neighbourhood walk.
     valid_c = -1
-    curr_c = start_c
-    iters3 = 0
-    while iters3 < 500:
-        iters3 += 1
-        if V[3*(curr_c//3)] != -1:
-            valid_c = curr_c
-            break
-        opp = O[prev_c(curr_c)]
-        if opp == -1:
-            break
-        curr_c = prev_c(opp)
-        if curr_c == start_c:
-            break
 
-    if valid_c == -1 and curr_c != start_c:
-        curr_c = start_c
-        iters4 = 0
-        while iters4 < 500:
-            iters4 += 1
-            opp = O[next_c(curr_c)]
-            if opp == -1:
+    # Build candidates array: opposites of deleted triangles that still exist.
+    cands = np.empty(4, dtype=np.int32)
+    cands[0] = o1
+    cands[1] = o2
+    cands[2] = o3 if o != -1 else np.int32(-1)
+    cands[3] = o4 if o != -1 else np.int32(-1)
+
+    for ci in range(4):
+        candidate = cands[ci]
+        if candidate != -1 and V[3*(candidate//3)] != -1:
+            base = 3 * (candidate // 3)
+            for off in range(3):
+                if V[base + off] == v_to:
+                    valid_c = base + off
+                    break
+            if valid_c != -1:
                 break
-            curr_c = next_c(opp)
+
+    # Fallback: walk from start_c if the opposites didn't yield a hit
+    if valid_c == -1:
+        curr_c = start_c
+        iters3 = 0
+        while iters3 < 500:
+            iters3 += 1
             if V[3*(curr_c//3)] != -1:
                 valid_c = curr_c
                 break
+            opp = O[prev_c(curr_c)]
+            if opp == -1:
+                break
+            curr_c = prev_c(opp)
+            if curr_c == start_c:
+                break
+
+        if valid_c == -1 and curr_c != start_c:
+            curr_c = start_c
+            iters4 = 0
+            while iters4 < 500:
+                iters4 += 1
+                opp = O[next_c(curr_c)]
+                if opp == -1:
+                    break
+                curr_c = next_c(opp)
+                if V[3*(curr_c//3)] != -1:
+                    valid_c = curr_c
+                    break
 
     if valid_c != -1:
-        if V2C[v_to] == -1 or V[3*(V2C[v_to]//3)] == -1:
-            V2C[v_to] = valid_c
+        V2C[v_to] = valid_c
+    elif V2C[v_to] != -1 and V[3*(V2C[v_to]//3)] == -1:
+        V2C[v_to] = -1
 
     return True
 
@@ -540,11 +566,12 @@ def decimate_loop(V, O, V2C, V_coords, Q, target_faces,
                 best_opt[2] = opt_pos[2]
 
         if best_c != -1:
+            was_interior = O[prev_c(best_c)] != -1
             success = edge_collapse(
                 best_c, V, O, V2C, V_coords, Q, best_opt,
                 ring_from, ring_to, lock_boundaries)
             if success:
-                current_faces -= 2 if O[prev_c(best_c)] != -1 else 1
+                current_faces -= 2 if was_interior else 1
                 stagnant_fails = 0
             else:
                 stagnant_fails += 1
@@ -638,6 +665,12 @@ def decimate_mesh(V_coords: np.ndarray, triangles: np.ndarray, target_faces: int
     """
     Decimate an indexed triangle mesh directly.
     """
+    # Fix 5: Defensive degenerate triangle removal
+    t0, t1, t2 = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+    non_degen = (t0 != t1) & (t1 != t2) & (t0 != t2)
+    if not np.all(non_degen):
+        triangles = triangles[non_degen].copy()
+
     num_verts = len(V_coords)
     V, O, V2C = build_corner_table(triangles, num_verts)
 
@@ -646,7 +679,7 @@ def decimate_mesh(V_coords: np.ndarray, triangles: np.ndarray, target_faces: int
     build_quadrics(V, V_coords.astype(np.float64), Q)
 
     decimate_loop(V, O, V2C, V_coords, Q, target_faces,
-                  k_choices, lock_boundaries)
+                  k_choices=k_choices, lock_boundaries=lock_boundaries)
 
     return mesh_to_stl(V, V_coords)
 
