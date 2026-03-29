@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.tif
+*.mmap
+*.stl
+.pytest_cache
+*.log
