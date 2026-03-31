@@ -2,9 +2,12 @@ venv/
 __pycache__/
 *.tif
 *.mmap
+*.error.mmap
 *.stl
 *.stl.tmp
 .pytest_cache
 *.log
 paru/
 vllm_rocm/
+visual_check*/
+*.png
