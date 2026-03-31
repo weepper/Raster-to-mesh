@@ -65,12 +65,13 @@ Convert a folder of GeoTIFFs into a 3D printable STL.
 
 ```bash
 python generate_mesh.py input_folder output.stl \
-    --resolution 1.0 \
-    --width-cm 10 \
-    --length-cm 10 \
-    --height-cm 3 \
-    --base-cm 0.5 \
-    --target-faces 500000
+    -r 1.0 \
+    -W 10 \
+    -L 10 \
+    -H 3 \
+    -B 0.5 \
+    -e 0.05 \
+    -d 5
 ```
 
 ### Key CLI Parameters
@@ -78,30 +79,33 @@ python generate_mesh.py input_folder output.stl \
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
 | `-r, --resolution` | `1.0` | Grid resolution in meters. ≤2m enables nearest neighbor for sharp features. |
-| `-W, --width-cm` | `10.0` | Physical output width in cm. |
-| `-f, --target-faces` | `500000` | Target triangle count after decimation. |
-| `-B, --base-cm` | `0.5` | Thickness of the solid base under the terrain. |
-| `-T, --planar-tolerance` | `0.1` | RTIN subdivision error threshold (smaller = more detail). Minimum: 0.06mm. |
+| `-W, --width` | `10.0` | Physical output width in cm. |
+| `-L, --length` | `10.0` | Physical output length in cm. |
+| `-H, --height` | `3.0` | Physical output height in cm. |
+| `-B, --base` | `0.0` | Thickness of the solid base under the terrain (cm, 0 = no base). |
+| `-e, --error-threshold` | `0.05` | RTIN subdivision error threshold in meters (smaller = more detail). Minimum: 0.00006m (0.06mm). |
 | `-d, --max-depth` | `5` | Maximum refinement depth. Higher = more detail. Recommended: ≤15. |
+| `-w, --window-size` | `512` | Attention window size for streaming RTIN. |
+| `-o, --overlap` | `0.5` | Overlap ratio between windows (0.0-1.0). |
 
 ### Examples
 
 **Standard terrain mesh (smooth hills):**
 ```bash
 python generate_mesh.py input_folder output.stl \
-    -r 5 -W 15 -L 15 -H 3 -B 0.5 -T 0.05 -d 10
+    -r 5 -W 15 -L 15 -H 3 -B 0.5 -e 0.05 -d 10
 ```
 
 **High-detail mesh with buildings and trees:**
 ```bash
 python generate_mesh.py input_folder output.stl \
-    -r 1 -W 15 -L 15 -H 3 -B 0.5 -T 0.01 -d 15
+    -r 1 -W 15 -L 15 -H 3 -B 0.5 -e 0.01 -d 15
 ```
 
 **Ultra-high precision mesh (0.06mm layer height printers):**
 ```bash
 python generate_mesh.py input_folder output.stl \
-    -r 1 -W 17.5 -L 17.5 -H 3 -B 0.5 -T 0.00006 -d 20
+    -r 1 -W 17.5 -L 17.5 -H 3 -B 0.5 -e 0.00006 -d 20
 ```
 
 ### Sampling Modes
