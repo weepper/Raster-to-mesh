@@ -1209,7 +1209,7 @@ def _split_edge_atomic(
                 new_tri_2 = [mid_idx, v_b_local, opp_local]
 
                 # Mark old triangle as processed
-                processed[tri_idx] = True
+                processed.add(tri_idx)
                 triangles_list[tri_idx] = None  # Mark for deletion
 
                 new_triangles_info.append((tri_idx, new_tri_1, new_tri_2))
@@ -1290,12 +1290,6 @@ def _refine_triangles_batch_sequential(
         error_resolution if error_resolution is not None else resolution
     )
 
-    # Safety checks for extreme parameters
-    if max_depth > MAX_DEPTH_HARD_LIMIT:
-        logger.warning(
-            f"Max depth {max_depth} exceeds recommended limit {MAX_DEPTH_HARD_LIMIT}"
-        )
-
     # Calculate safe upper bound - prevent integer overflow
     # Cap max_depth for estimation purposes
     safe_depth = min(max_depth, 30)  # 2**30 is ~1 billion, manageable
@@ -1310,8 +1304,8 @@ def _refine_triangles_batch_sequential(
             f"max depth {max_depth}, limit {max_triangles:,} triangles"
         )
 
-    # Use boolean numpy array instead of set for O(1) lookups without hashing overhead
-    processed = np.zeros(max_triangles, dtype=np.bool_)
+    # Use Python set for dynamic growth - indices can exceed initial estimate
+    processed = set()
 
     # Use deque for O(1) popleft() instead of list O(n) pop(0)
     queue = deque([(i, 0) for i in range(len(triangles_list))])
@@ -1321,10 +1315,9 @@ def _refine_triangles_batch_sequential(
     while queue:
         list_idx, depth = queue.popleft()
 
-        if list_idx < max_triangles and processed[list_idx]:
+        if list_idx in processed:
             continue
-        if list_idx < max_triangles:
-            processed[list_idx] = True
+        processed.add(list_idx)
 
         if list_idx >= len(triangles_list):
             continue
@@ -1620,14 +1613,7 @@ def create_native_stl(
     overlap: float = 0.5,
 ):
     """Main entry point: streaming terrain-to-STL pipeline with low memory usage."""
-    # Validate max_depth parameter to prevent overflow
-    if max_depth > MAX_DEPTH_HARD_LIMIT:
-        logger.warning(
-            f"Max depth {max_depth} exceeds safe limit {MAX_DEPTH_HARD_LIMIT}, "
-            f"capping to prevent integer overflow and memory exhaustion"
-        )
-        max_depth = MAX_DEPTH_HARD_LIMIT
-
+    # Validate max_depth parameter - warn only, no enforcement
     if max_depth > 15:
         logger.warning(
             f"High max_depth ({max_depth}) may generate millions of triangles "
@@ -1708,16 +1694,7 @@ def create_native_stl(
         # The raster is normalized to model space (0 to height_mm), so we convert threshold to mm
         error_threshold_mm = error_threshold_m * 1000  # Convert to mm
 
-        # Validate error threshold - warn about extreme values
-        if error_threshold_m < MIN_ERROR_THRESHOLD_M:
-            logger.warning(
-                f"Error threshold {error_threshold_m:.8f}m is below safe minimum "
-                f"({MIN_ERROR_THRESHOLD_M}m). Using minimum threshold to prevent "
-                f"numerical precision issues and excessive triangle counts."
-            )
-            error_threshold_m = MIN_ERROR_THRESHOLD_M
-            error_threshold_mm = error_threshold_m * 1000
-
+        # Validate error threshold - warn only, no enforcement
         if error_threshold_m < 0.01:  # Less than 1cm
             logger.warning(
                 f"Very small error threshold ({error_threshold_m:.6f}m) may generate "
@@ -1729,10 +1706,11 @@ def create_native_stl(
             f"Error threshold: {error_threshold_m:.6f}m ({error_threshold_mm:.4f} mm)"
         )
 
-        # Phase 4: Add skirt (in-place)
-        logger.info("Phase 4: Adding skirt...")
-        add_skirt_inplace(Z_global)
-        log_memory("After skirt")
+        # Phase 4: Add skirt (in-place) - DISABLED to ensure mesh boundary matches terrain
+        # The skirt was causing walls to extend beyond the actual terrain due to RTIN simplification
+        # logger.info("Phase 4: Adding skirt...")
+        # add_skirt_inplace(Z_global)
+        # log_memory("After skirt")
 
         # Phase 4.5: Repair (always fills small holes)
         repair_elevation_inplace(Z_global)
@@ -2090,132 +2068,200 @@ def create_native_stl(
             logger.info(
                 f"  Indexed mesh: {len(V_coords):,} vertices, {len(triangles):,} triangles"
             )
-            logger.info("  Adding walls and base...")
 
-            # Generate walls from terrain boundary
-            # Use the existing approach that creates separate wall vertices
-            from decimation import (
-                build_corner_table,
-                _collect_boundary_edges,
-                _extract_boundary_loops,
-                _triangulate_polygon_2d,
+            # === FIX 1: Coordinate snapping pass to eliminate T-junctions ===
+            # Use tighter tolerance to merge nearly-identical vertices that
+            # would otherwise cause internal edges to be misidentified as boundaries
+            SNAP_TOLERANCE = 0.0001  # 0.0001mm = 0.1 micron
+            V_coords_snapped = np.round(V_coords / SNAP_TOLERANCE) * SNAP_TOLERANCE
+            unique_v, inv_idx = np.unique(V_coords_snapped, axis=0, return_inverse=True)
+            triangles = inv_idx[triangles].astype(np.int32)
+            V_coords = unique_v
+
+            # Remove any degenerate triangles that may have resulted from snapping
+            t0, t1, t2 = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+            non_degen = (t0 != t1) & (t1 != t2) & (t0 != t2)
+            triangles = triangles[non_degen]
+
+            logger.info(
+                f"  After snapping: {len(V_coords):,} vertices, {len(triangles):,} triangles"
             )
 
+            logger.info("  Adding walls and base...")
+
+            # Step 1: Remove sloped boundary triangles from terrain
+            # These are RTIN triangles at boundaries that slope from terrain to Z≈0
+            # Identify triangles with any vertex near Z=0 (before elevation)
+            z_min_vertex = V_coords[:, 2].min()
+            z_threshold_low = z_min_vertex + 0.1  # Within 0.1mm of minimum Z
+
+            # Calculate per-vertex mask (is vertex near bottom?)
+            vertex_near_bottom = V_coords[:, 2] < z_threshold_low
+
+            # Identify triangles with vertices near bottom
+            tris_with_bottom_vertex = (
+                vertex_near_bottom[triangles[:, 0]]
+                | vertex_near_bottom[triangles[:, 1]]
+                | vertex_near_bottom[triangles[:, 2]]
+            )
+
+            # Also check if triangle has large Z range (sloped)
+            tri_z_min = np.minimum(
+                np.minimum(V_coords[triangles[:, 0], 2], V_coords[triangles[:, 1], 2]),
+                V_coords[triangles[:, 2], 2],
+            )
+            tri_z_max = np.maximum(
+                np.maximum(V_coords[triangles[:, 0], 2], V_coords[triangles[:, 1], 2]),
+                V_coords[triangles[:, 2], 2],
+            )
+            tri_z_range = tri_z_max - tri_z_min
+
+            # Mark sloped boundary triangles for removal
+            # These have: (1) vertex near Z=0 AND (2) large Z range
+            is_sloped_boundary = tris_with_bottom_vertex & (tri_z_range > 1.0)
+
+            logger.info(
+                f"    Removing {np.sum(is_sloped_boundary)} sloped boundary triangles"
+            )
+
+            # Keep only non-sloped triangles
+            keep_mask = ~is_sloped_boundary
+            triangles = triangles[keep_mask]
+
+            # Remove unreferenced vertices
+            referenced = np.unique(triangles)
+            old_to_new = np.full(len(V_coords), -1, dtype=np.int32)
+            old_to_new[referenced] = np.arange(len(referenced))
+            V_coords = V_coords[referenced]
+            triangles = old_to_new[triangles]
+
+            logger.info(
+                f"    After filtering: {len(V_coords)} vertices, {len(triangles)} triangles"
+            )
+
+            # Step 2: Extract boundary edges from filtered terrain
+            from collections import defaultdict
+
+            edge_to_tris = defaultdict(list)
+
+            for tri_idx, (v0, v1, v2) in enumerate(triangles):
+                edges = [
+                    (min(v0, v1), max(v0, v1)),
+                    (min(v1, v2), max(v1, v2)),
+                    (min(v2, v0), max(v2, v0)),
+                ]
+                for edge in edges:
+                    edge_to_tris[edge].append(tri_idx)
+
+            boundary_edges = [
+                edge for edge, tris in edge_to_tris.items() if len(tris) == 1
+            ]
+
+            logger.info(f"    Found {len(boundary_edges)} boundary edges")
+
             num_verts = len(V_coords)
-            V, O, V2C = build_corner_table(triangles, num_verts)
 
-            max_b_edges = len(triangles)
-            b_edges_arr = np.empty((max_b_edges, 2), dtype=np.int32)
-            n_b_all = _collect_boundary_edges(V, O, b_edges_arr)
-            b_edges_all = b_edges_arr[:n_b_all]
+            # Elevate terrain vertices by base_mm
+            V_coords_elevated = V_coords.copy()
+            V_coords_elevated[:, 2] += config.base_mm
 
-            if n_b_all > 0:
-                # Find external boundary edges (appear only once)
-                sorted_edges = np.sort(b_edges_all, axis=1)
-                edge_view = sorted_edges.view(np.dtype([("v", np.int32, (2,))]))
-                uv, inv, counts = np.unique(
-                    edge_view, return_inverse=True, return_counts=True
+            # Create walls by extruding boundary edges downward
+            wall_vertices = []
+            wall_triangles = []
+
+            for v0_idx, v1_idx in boundary_edges:
+                # Get the two vertices of this boundary edge
+                v0_top = V_coords_elevated[v0_idx]
+                v1_top = V_coords_elevated[v1_idx]
+
+                # Create bottom vertices (same X,Y, at z_bottom)
+                v0_bottom = np.array([v0_top[0], v0_top[1], z_bottom], dtype=np.float32)
+                v1_bottom = np.array([v1_top[0], v1_top[1], z_bottom], dtype=np.float32)
+
+                # Add vertices
+                base_idx = len(wall_vertices)
+                wall_vertices.extend([v0_top, v1_top, v0_bottom, v1_bottom])
+
+                # Create two triangles for this wall segment
+                # Triangle 1: v0_top, v1_top, v0_bottom
+                # Triangle 2: v1_top, v1_bottom, v0_bottom
+                wall_triangles.append([base_idx + 0, base_idx + 1, base_idx + 2])
+                wall_triangles.append([base_idx + 1, base_idx + 3, base_idx + 2])
+
+            wall_vertices = np.array(wall_vertices, dtype=np.float32)
+            wall_triangles = np.array(wall_triangles, dtype=np.int64)
+
+            # Offset wall triangle indices to account for terrain vertices
+            wall_triangles += num_verts
+
+            logger.info(f"    Created {len(wall_triangles)} wall triangles")
+
+            # Create base (flat rectangle at z_bottom) matching wall footprint
+            # Use the inner bounds (minimum coverage) to ensure base doesn't extend beyond walls
+            if len(wall_vertices) > 0:
+                wall_bottom_v0 = wall_vertices[2::4]  # v0_bottom vertices
+                wall_bottom_v1 = wall_vertices[3::4]  # v1_bottom vertices
+                all_bottom = np.vstack([wall_bottom_v0, wall_bottom_v1])
+
+                # Find vertices on each edge with tolerance
+                tol = 0.1
+                x_min_global, x_max_global = (
+                    all_bottom[:, 0].min(),
+                    all_bottom[:, 0].max(),
                 )
-                manifold_mask = (counts[inv] == 1).ravel()
-                external_b_edges = b_edges_all[manifold_mask]
-                n_b = len(external_b_edges)
+                y_min_global, y_max_global = (
+                    all_bottom[:, 1].min(),
+                    all_bottom[:, 1].max(),
+                )
 
-                if n_b > 0:
-                    # Add wall vertices (one per unique boundary vertex)
-                    unique_b_v_ids = np.unique(external_b_edges)
-                    n_new = len(unique_b_v_ids)
-                    v_to_bottom = np.full(num_verts, -1, dtype=np.int32)
-                    new_v_coords = np.empty((n_new, 3), dtype=np.float32)
+                left = all_bottom[np.abs(all_bottom[:, 0] - x_min_global) < tol]
+                right = all_bottom[np.abs(all_bottom[:, 0] - x_max_global) < tol]
+                bottom = all_bottom[np.abs(all_bottom[:, 1] - y_min_global) < tol]
+                top = all_bottom[np.abs(all_bottom[:, 1] - y_max_global) < tol]
 
-                    for i, old_v in enumerate(unique_b_v_ids):
-                        v_to_bottom[old_v] = num_verts + i
-                        new_v_coords[i, 0] = V_coords[old_v, 0]
-                        new_v_coords[i, 1] = V_coords[old_v, 1]
-                        new_v_coords[i, 2] = z_bottom
-
-                    # Create wall triangles
-                    wall_tris = np.empty((n_b * 2, 3), dtype=np.int64)
-                    for i in range(n_b):
-                        v1, v2 = external_b_edges[i]
-                        v1_b = v_to_bottom[v1]
-                        v2_b = v_to_bottom[v2]
-
-                        wall_tris[2 * i, 0] = v1
-                        wall_tris[2 * i, 1] = v1_b
-                        wall_tris[2 * i, 2] = v2
-                        wall_tris[2 * i + 1, 0] = v2
-                        wall_tris[2 * i + 1, 1] = v1_b
-                        wall_tris[2 * i + 1, 2] = v2_b
-
-                    # Chain boundary edges into loops for base triangulation
-                    loops = _extract_boundary_loops(external_b_edges)
-
-                    # Create base triangles
-                    base_tris = []
-                    for loop in loops:
-                        if len(loop) < 3:
-                            continue
-
-                        loop_bottom_indices = [v_to_bottom[v] for v in loop]
-                        loop_2d = np.array(
-                            [
-                                [
-                                    new_v_coords[v_to_bottom[v] - num_verts, 0],
-                                    new_v_coords[v_to_bottom[v] - num_verts, 1],
-                                ]
-                                for v in loop
-                            ],
-                            dtype=np.float64,
-                        )
-
-                        loop_indices = np.arange(len(loop), dtype=np.int32)
-                        tri_2d = _triangulate_polygon_2d(loop_2d, loop_indices)
-
-                        for tri in tri_2d:
-                            v0 = loop_bottom_indices[tri[0]]
-                            v1 = loop_bottom_indices[tri[1]]
-                            v2 = loop_bottom_indices[tri[2]]
-                            base_tris.append([v0, v1, v2])
-
-                    if base_tris:
-                        final_base_tris = np.array(base_tris, dtype=np.int64)
-                        final_v = np.vstack([V_coords, new_v_coords])
-                        final_t = np.vstack([triangles, wall_tris, final_base_tris])
-                    else:
-                        # Fallback: simple rectangle
-                        min_x, max_x = (
-                            new_v_coords[:, 0].min(),
-                            new_v_coords[:, 0].max(),
-                        )
-                        min_y, max_y = (
-                            new_v_coords[:, 1].min(),
-                            new_v_coords[:, 1].max(),
-                        )
-                        base_v_start = num_verts + n_new
-                        base_v = np.array(
-                            [
-                                [min_x, min_y, z_bottom],
-                                [max_x, min_y, z_bottom],
-                                [max_x, max_y, z_bottom],
-                                [min_x, max_y, z_bottom],
-                            ],
-                            dtype=np.float32,
-                        )
-                        base_t = np.array(
-                            [
-                                [base_v_start, base_v_start + 1, base_v_start + 2],
-                                [base_v_start, base_v_start + 2, base_v_start + 3],
-                            ],
-                            dtype=np.int32,
-                        )
-                        final_v = np.vstack([V_coords, new_v_coords, base_v])
-                        final_t = np.vstack([triangles, wall_tris, base_t])
-
-                    final_v, final_t = final_v, final_t
-                else:
-                    final_v, final_t = V_coords, triangles
+                # Use INNER bounds - max of mins and min of maxs
+                # This ensures the base fits within the walls, not extends beyond
+                x_min = left[:, 0].max() if len(left) > 0 else x_min_global
+                x_max = right[:, 0].min() if len(right) > 0 else x_max_global
+                y_min = bottom[:, 1].max() if len(bottom) > 0 else y_min_global
+                y_max = top[:, 1].min() if len(top) > 0 else y_max_global
             else:
-                final_v, final_t = V_coords, triangles
+                x_min, x_max = V_coords[:, 0].min(), V_coords[:, 0].max()
+                y_min, y_max = V_coords[:, 1].min(), V_coords[:, 1].max()
+
+            logger.info(
+                f"    Base bounds: X={x_min:.2f} to {x_max:.2f}, Y={y_min:.2f} to {y_max:.2f}"
+            )
+
+            base_corners = np.array(
+                [
+                    [x_min, y_min, z_bottom],
+                    [x_max, y_min, z_bottom],
+                    [x_max, y_max, z_bottom],
+                    [x_min, y_max, z_bottom],
+                ],
+                dtype=np.float32,
+            )
+
+            base_start = num_verts + len(wall_vertices)
+            base_triangles = np.array(
+                [
+                    [base_start + 0, base_start + 1, base_start + 2],
+                    [base_start + 0, base_start + 2, base_start + 3],
+                ],
+                dtype=np.int64,
+            )
+
+            # Combine all
+            # Combine all vertices and triangles
+            final_v = np.vstack([V_coords_elevated, wall_vertices, base_corners])
+            final_t = np.vstack([triangles, wall_triangles, base_triangles])
+
+            logger.info(f"    Elevated terrain by {config.base_mm}mm")
+            logger.info(
+                f"    Created {len(wall_triangles)} wall triangles, {len(base_triangles)} base triangles"
+            )
+            logger.info(f"    Total: {len(final_v)} vertices, {len(final_t)} triangles")
 
             logger.info(
                 f"  Final mesh: {len(final_v):,} vertices, {len(final_t):,} triangles"
